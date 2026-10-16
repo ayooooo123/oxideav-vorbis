@@ -181,7 +181,6 @@ fn roundtrip_through(
             match decoder.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     assert_eq!(a.data.len(), 1, "planar mono: one plane");
-                    assert_eq!(a.pts, Some(decoded.len() as i64), "sample-granularity PTS");
                     decoded.extend(plane_f32(&a.data[0]));
                 }
                 Ok(other) => panic!("expected audio frame, got {other:?}"),
@@ -227,6 +226,52 @@ fn direct_factory_endpoints_roundtrip_pcm() {
     let (bytes, snr) = roundtrip_through(encoder, decoder);
     eprintln!("direct path: {bytes} packet bytes, SNR {snr:.2} dB");
     assert!(snr >= 20.0, "direct round-trip SNR {snr:.2} dB below 20");
+}
+
+/// A frame is stamped with the pts of the packet that finishes it, in the
+/// stream's time base. Fed Matroska's millisecond stamps (each packet's
+/// samples start there), every frame says the millisecond its own samples
+/// start at, not a count of samples: that reads 44 times too late in a
+/// 1/1000 time base at 44.1 kHz, and restarts from 0 after a seek.
+#[test]
+fn frames_are_stamped_in_the_stream_time_base() {
+    let params = encoder_params();
+    let mut encoder = make_encoder(&params).expect("encoder builds");
+    let pcm = test_signal(3);
+    let frame = Frame::Audio(AudioFrame { samples: pcm.len() as u32, pts: Some(0), data: vec![f32_plane(&pcm)] });
+    encoder.send_frame(&frame).unwrap();
+    encoder.flush().unwrap();
+    let mut packets = Vec::new();
+    while let Ok(p) = encoder.receive_packet() {
+        packets.push(p);
+    }
+    // Where each packet's samples start: what the ones before it decode to.
+    let mut decoder = make_decoder(&params).expect("decoder builds");
+    let mut starts = Vec::new();
+    let mut decoded = 0usize;
+    for p in &packets {
+        starts.push(decoded);
+        decoder.send_packet(p).unwrap();
+        while let Ok(Frame::Audio(a)) = decoder.receive_frame() {
+            decoded += a.samples as usize;
+        }
+    }
+    let ms = |samples: usize| (samples as i64 * 1000 + i64::from(RATE) / 2) / i64::from(RATE);
+    let mut decoder = make_decoder(&params).expect("decoder builds");
+    let mut decoded = 0usize;
+    let mut frames = 0;
+    for (p, &start) in packets.iter().zip(&starts) {
+        let mut p = p.clone();
+        p.time_base = oxideav_core::TimeBase::new(1, 1000);
+        p.pts = Some(ms(start));
+        decoder.send_packet(&p).unwrap();
+        while let Ok(Frame::Audio(a)) = decoder.receive_frame() {
+            assert_eq!(a.pts, Some(ms(decoded)), "frame {frames}");
+            decoded += a.samples as usize;
+            frames += 1;
+        }
+    }
+    assert!(frames > 10, "{frames} frames");
 }
 
 #[test]

@@ -56,8 +56,6 @@ pub struct VorbisDecoder {
     streaming: Option<StreamingDecoder>,
     /// Decoded frames awaiting `receive_frame`.
     queue: VecDeque<Frame>,
-    /// Running PCM sample position (per channel) for frame PTS.
-    position: i64,
     /// `flush()` was called: drain then EOF.
     flushed: bool,
 }
@@ -67,7 +65,6 @@ impl std::fmt::Debug for VorbisDecoder {
         f.debug_struct("VorbisDecoder")
             .field("stage", &self.stage)
             .field("queued", &self.queue.len())
-            .field("position", &self.position)
             .finish()
     }
 }
@@ -83,7 +80,6 @@ impl VorbisDecoder {
             setup: None,
             streaming: None,
             queue: VecDeque::new(),
-            position: 0,
             flushed: false,
         }
     }
@@ -116,14 +112,14 @@ impl VorbisDecoder {
         }
         let mut dec = Self::new();
         for packet in &packets {
-            dec.consume_packet(packet)?;
+            dec.consume_packet(packet, None)?;
         }
         debug_assert_eq!(dec.stage, HeaderStage::Audio);
         Ok(dec)
     }
 
     /// The stream's sample rate once the identification header has
-    /// been parsed (frame PTS values count samples at this rate).
+    /// been parsed.
     #[must_use]
     pub fn sample_rate(&self) -> Option<u32> {
         self.id.as_ref().map(|id| id.audio_sample_rate)
@@ -142,7 +138,7 @@ impl Decoder for VorbisDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.consume_packet(&packet.data)
+        self.consume_packet(&packet.data, packet.pts)
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
@@ -171,9 +167,6 @@ impl Decoder for VorbisDecoder {
         }
         self.queue.clear();
         self.flushed = false;
-        // Sample position restarts; the demuxer re-stamps packet
-        // timestamps after a seek.
-        self.position = 0;
         Ok(())
     }
 }
@@ -182,8 +175,12 @@ impl VorbisDecoder {
     /// One codec packet's bytes through the §4.2.1 header state
     /// machine / §4.3 audio pipeline — the shared body behind both
     /// [`Decoder::send_packet`] (in-band packets) and
-    /// [`VorbisDecoder::with_extradata`] (codec-private headers).
-    fn consume_packet(&mut self, data: &[u8]) -> Result<()> {
+    /// [`VorbisDecoder::with_extradata`] (codec-private headers). The
+    /// frame an audio packet finishes is stamped with that packet's pts,
+    /// in the stream's time base, as `AudioFrame::pts` documents: its
+    /// samples start there (the first audio packet, whose half only
+    /// primes the §4.3.8 lapping, returns none).
+    fn consume_packet(&mut self, data: &[u8], pts: Option<i64>) -> Result<()> {
         let kind = classify_packet(data)
             .map_err(|e| Error::invalid(format!("vorbis: unclassifiable packet: {e}")))?;
         match (self.stage, kind) {
@@ -235,10 +232,9 @@ impl VorbisDecoder {
                         .collect();
                     let frame = AudioFrame {
                         samples: samples as u32,
-                        pts: Some(self.position),
+                        pts,
                         data,
                     };
-                    self.position += samples as i64;
                     self.queue.push_back(Frame::Audio(frame));
                 }
                 Ok(())
