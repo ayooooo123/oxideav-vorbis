@@ -42,6 +42,12 @@ All notable changes to `oxideav-vorbis` are recorded here.
 
 ### Changed
 
+- A decoded frame's `pts` is now the `pts` of the packet that completes
+  it, in the stream's time base, as FFmpeg's decoder stamps it. It was a
+  running count of samples since the decoder opened or reset, which put
+  frames in the wrong place in any time base other than 1/sample-rate and
+  restarted at zero after a seek. A packet without a `pts` gives a frame
+  without one.
 - ABR bit targeting bisects the **quality** (log-linear in `lambda`)
   over eight halvings instead of `lambda` linearly over six: with the
   low-rate law spanning six decades, linear bisection resolved only
