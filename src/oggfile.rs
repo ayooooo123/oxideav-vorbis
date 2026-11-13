@@ -46,39 +46,39 @@
 //! `max(signal, masking threshold)` and the residue chooser charges
 //! `weights · error²  + λ · bits` per §8.6 partition).
 
+use crate::VorbisCommentHeader;
 use crate::audio::AudioDecoderState;
-use crate::blocksize::{plan_block_sequence_perceptual, BlocksizeError};
+use crate::blocksize::{BlocksizeError, plan_block_sequence_perceptual};
 use crate::codebook::{VorbisCodebook, VqLookup};
 use crate::encoder::{
-    write_audio_packet, write_comment_header, write_identification_header, write_setup_header,
     AudioChannelFloor, Floor1Packet, ResidueVectorPlan, WriteAudioPacketError, WriteError,
+    write_audio_packet, write_comment_header, write_identification_header, write_setup_header,
 };
 use crate::floor1::Floor1Decoder;
-use crate::floor1_encode::{plan_floor1_y, Floor1EncodeError};
-use crate::floor1_envelope::{plan_floor1_envelope, Floor1EnvelopeError};
-use crate::floor1_layout::{design_floor1_header, Floor1LayoutError};
+use crate::floor1_encode::{Floor1EncodeError, plan_floor1_y};
+use crate::floor1_envelope::{Floor1EnvelopeError, plan_floor1_envelope};
+use crate::floor1_layout::{Floor1LayoutError, design_floor1_header};
 use crate::framing::{FrameSplitter, FramingError};
-use crate::identification::{parse_identification_header, VorbisIdentificationHeader};
-use crate::mdct::{mdct_vec, MdctError};
+use crate::identification::{VorbisIdentificationHeader, parse_identification_header};
+use crate::mdct::{MdctError, mdct_vec};
 use crate::packet::AudioPacketHeader;
-use crate::packet_kind::{classify_packet, ClassifyError, PacketKind};
+use crate::packet_kind::{ClassifyError, PacketKind, classify_packet};
 use crate::psy::{
+    Complex, MaskingAnalysis, PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
     complex_spectrum, compute_masking_with_predictability, plan_psy_floor_envelope,
-    residue_bin_weights, residue_partition_weights, unpredictability, Complex, MaskingAnalysis,
-    PsyConfig, PsyError, TemporalMasking, TemporalMaskingConfig,
+    residue_bin_weights, residue_partition_weights, unpredictability,
 };
 use crate::quality::{EncoderTuning, QualityError};
 use crate::residue_encode::{
-    plan_partition_cascade_scored_weighted, plan_vector_classifications_rd_bin_weighted,
-    ResidueEncodeError,
+    ResidueEncodeError, plan_partition_cascade_scored_weighted,
+    plan_vector_classifications_rd_bin_weighted,
 };
 use crate::setup::{
-    parse_setup_header, Floor1Class, FloorHeader, FloorKind, MappingCouplingStep, MappingHeader,
-    MappingSubmap, ModeHeader, ResidueHeader, VorbisSetupHeader,
+    Floor1Class, FloorHeader, FloorKind, MappingCouplingStep, MappingHeader, MappingSubmap,
+    ModeHeader, ResidueHeader, VorbisSetupHeader, parse_setup_header,
 };
 use crate::streaming::{StreamingDecoder, StreamingError, StreamingFrame};
-use crate::synthesis::{forward_couple_all, WindowError};
-use crate::VorbisCommentHeader;
+use crate::synthesis::{WindowError, forward_couple_all};
 use oxideav_core::{CodecId, CodecParameters, StreamInfo, TimeBase};
 use oxideav_ogg::page::Page;
 
@@ -93,15 +93,41 @@ const PARTITION_SIZE_SHORT: u32 = 16;
 /// fidelity cost.
 const PARTITION_SIZE_LONG: u32 = 32;
 
+/// The long-block partition size in the low-bitrate mode
+/// ([`EncoderTuning::low_rate_depth`] `> 0`): at low rate most coded
+/// partitions mix a few spectral lines with near-silent bins, and the
+/// finer classification granularity lets the chooser silence or
+/// cheapen the empty halves for one extra grouped classword
+/// (measured on the 4096-sample geometry: 3–8 % fewer audio bytes at
+/// equal or better SNR across tonal, piano and music material).
+const PARTITION_SIZE_LOW_RATE_LONG: u32 = 16;
+
 /// The partition size a residue covering `half_n` spectral bins uses:
 /// [`PARTITION_SIZE_LONG`] once the spectrum is at least 512 bins
 /// (blocksize ≥ 1024), [`PARTITION_SIZE_SHORT`] below.
-fn partition_size_for(half_n: u32) -> u32 {
-    if half_n >= 512 {
+fn partition_size_for(half_n: u32, low_rate: bool) -> u32 {
+    if half_n >= 512 && low_rate {
+        PARTITION_SIZE_LOW_RATE_LONG
+    } else if half_n >= 512 {
         PARTITION_SIZE_LONG
     } else {
         PARTITION_SIZE_SHORT
     }
+}
+
+/// The audibility-weight ceiling's compression exponent in the
+/// low-bitrate mode (see `psy::residue_bin_weights_soft`): past the
+/// 40 dB ceiling a ratio still counts with its square root. Chosen by
+/// measurement over {0, 0.5, 1}: `1` (no ceiling) and `0` (the hard
+/// cap) land on the same rate–SNR curve on tonal material, `0.5` sits
+/// 1–2 dB above both at 20–40 kbps.
+const LOW_RATE_WEIGHT_GAMMA: f64 = 0.5;
+
+/// Per-partition means of a per-bin weight row.
+fn partition_means(bw: &[f64], ps: usize) -> Vec<f64> {
+    bw.chunks(ps)
+        .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
+        .collect()
 }
 
 /// The quantile of the per-partition peak |target| distribution the
@@ -310,8 +336,17 @@ fn angle_weight_scale(f_hz: f32, tuning: &EncoderTuning) -> f32 {
     }
 }
 
+/// The smallest long blocksize the low-bitrate mode codes on when
+/// [`StreamEncoderConfig::low_rate_geometry`] is set.
+pub const LOW_RATE_MIN_BLOCKSIZE: usize = 4096;
+
+/// The smallest short blocksize the low-bitrate mode codes on when
+/// [`StreamEncoderConfig::low_rate_geometry`] is set.
+pub const LOW_RATE_MIN_SHORT_BLOCKSIZE: usize = 512;
+
 /// Configuration for [`encode_pcm_to_ogg`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct StreamEncoderConfig {
     /// PCM sample rate in Hz (§4.2.2 `audio_sample_rate`).
     pub sample_rate: u32,
@@ -396,10 +431,88 @@ pub struct StreamEncoderConfig {
     /// their per-scalar resolution collapses (see
     /// [`OggFileError::BadVqDims`]).
     pub vq_dims: u16,
+    /// **Low-bitrate geometry**: in the encoder's low-bitrate mode
+    /// (quality below [`crate::quality::LOW_BITRATE_KNEE`], which an
+    /// ABR target under ~60–100 kbps lands in) the block pair is
+    /// raised to at least [`LOW_RATE_MIN_BLOCKSIZE`] /
+    /// [`LOW_RATE_MIN_SHORT_BLOCKSIZE`] (a single-blocksize
+    /// configuration stays single-size). The doubled long transform
+    /// halves the per-second floor and classword overhead and doubles
+    /// the spectral resolution steady partials are coded at — measured
+    /// at 12–40 kbps: −36 % audio bytes at equal SNR on tonal
+    /// material, −30 % on speech, +4 dB at equal rate on a music mix,
+    /// transients unchanged — and the 512-sample short block keeps
+    /// its attack confinement. `true` in [`Self::new`]; `false` codes
+    /// on exactly [`Self::blocksize`] / [`Self::short_blocksize`] at
+    /// every quality.
+    pub low_rate_geometry: bool,
     // internal A/B lever for the amplitude-band ladder — exposed for
     // tests/measurement; not part of the stable API
     #[doc(hidden)]
     pub residue_bands: bool,
+}
+
+impl StreamEncoderConfig {
+    /// Builder-style setter for [`sample_rate`](Self::sample_rate).
+    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+    /// Builder-style setter for [`channels`](Self::channels).
+    pub fn with_channels(mut self, channels: u8) -> Self {
+        self.channels = channels;
+        self
+    }
+    /// Builder-style setter for [`coupling`](Self::coupling).
+    pub fn with_coupling(mut self, coupling: bool) -> Self {
+        self.coupling = coupling;
+        self
+    }
+    /// Builder-style setter for [`quality`](Self::quality).
+    pub fn with_quality(mut self, quality: f32) -> Self {
+        self.quality = quality;
+        self
+    }
+    /// Builder-style setter for [`target_bitrate`](Self::target_bitrate).
+    pub fn with_target_bitrate(mut self, target_bitrate: Option<u32>) -> Self {
+        self.target_bitrate = target_bitrate;
+        self
+    }
+    /// Builder-style setter for [`blocksize`](Self::blocksize).
+    pub fn with_blocksize(mut self, blocksize: usize) -> Self {
+        self.blocksize = blocksize;
+        self
+    }
+    /// Builder-style setter for [`short_blocksize`](Self::short_blocksize).
+    pub fn with_short_blocksize(mut self, short_blocksize: usize) -> Self {
+        self.short_blocksize = short_blocksize;
+        self
+    }
+    /// Builder-style setter for [`serial`](Self::serial).
+    pub fn with_serial(mut self, serial: u32) -> Self {
+        self.serial = serial;
+        self
+    }
+    /// Builder-style setter for [`training_iterations`](Self::training_iterations).
+    pub fn with_training_iterations(mut self, training_iterations: usize) -> Self {
+        self.training_iterations = training_iterations;
+        self
+    }
+    /// Builder-style setter for [`vq_dims`](Self::vq_dims).
+    pub fn with_vq_dims(mut self, vq_dims: u16) -> Self {
+        self.vq_dims = vq_dims;
+        self
+    }
+    /// Builder-style setter for [`low_rate_geometry`](Self::low_rate_geometry).
+    pub fn with_low_rate_geometry(mut self, low_rate_geometry: bool) -> Self {
+        self.low_rate_geometry = low_rate_geometry;
+        self
+    }
+    /// Builder-style setter for [`residue_bands`](Self::residue_bands).
+    pub fn with_residue_bands(mut self, residue_bands: bool) -> Self {
+        self.residue_bands = residue_bands;
+        self
+    }
 }
 
 impl StreamEncoderConfig {
@@ -432,6 +545,7 @@ impl StreamEncoderConfig {
             serial: 0x6F78_7662,
             training_iterations: 4,
             vq_dims: 2,
+            low_rate_geometry: true,
             residue_bands: true,
         }
     }
@@ -439,6 +553,7 @@ impl StreamEncoderConfig {
 
 /// Errors from the whole-stream encoder / decoder entry points.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum OggFileError {
     /// `channels` was zero or disagreed with the PCM row count.
     BadChannelCount {
@@ -608,6 +723,7 @@ const AUDIO_PAGE_TARGET_BYTES: usize = 4096;
 
 /// §A.2 packet-sequencing errors from [`mux_vorbis_stream`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MuxError {
     /// A header packet arrived out of §A.2 order (or an audio packet
     /// arrived where a header was required).
@@ -1125,6 +1241,7 @@ fn build_setup(
     residue_ends: &[u32],
     mode_specs: &[ModeSpec],
     switching: bool,
+    low_rate: bool,
 ) -> VorbisSetupHeader {
     let floors = floor_headers
         .into_iter()
@@ -1141,7 +1258,7 @@ fn build_setup(
             residue_type: 1,
             residue_begin: 0,
             residue_end,
-            partition_size: partition_size_for(half_n),
+            partition_size: partition_size_for(half_n, low_rate),
             classifications: classifications as u8,
             classbook: 1,
             cascade: ladder.cascade.clone(),
@@ -1197,6 +1314,7 @@ fn build_setup(
 /// §4.2 header packets plus the §4.3 audio packets with their absolute
 /// §A.2 granule positions — everything a container muxer needs.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EncodedVorbisStream {
     /// §4.2.2 identification-header packet.
     pub identification: Vec<u8>,
@@ -1541,7 +1659,9 @@ fn decoded_per_channel_snr(
 /// [`FLOOR_COVER_TOLERANCE_DB`], lifts the two posts bounding that bin
 /// by the deficit (in §10.1 ladder steps), iterating to a fixed point
 /// (at most [`FLOOR_COVER_PASSES`] passes; the lifts are monotone, so
-/// the loop terminates at the post range if nothing else). Lifting a
+/// the loop terminates at the post range if nothing else), starting
+/// from the energy-weighted covering repair (`min_covering_posts`)
+/// so only rounding deficits remain for it. Lifting a
 /// post can only shrink the residue targets on its segment, so the
 /// covered fit never widens the ladder and the quiet neighbours of a
 /// peak quantise toward zero a little more cheaply.
@@ -1553,8 +1673,14 @@ fn fit_covering_floor(
     decoder: &Floor1Decoder,
     half: usize,
 ) -> Result<(Vec<u32>, Vec<f32>), OggFileError> {
-    let mut posts = plan_floor1_envelope(envelope, header)?;
     let x_list = crate::floor1_encode::full_x_list(header);
+    let mut posts = min_covering_posts(
+        plan_floor1_envelope(envelope, header)?,
+        envelope,
+        &x_list,
+        header.multiplier,
+        half,
+    );
     // Posts in ascending-x order (the header's list is partition-tiled;
     // `full_x_list` is endpoints first, then the header order).
     let mut order: Vec<usize> = (0..x_list.len()).collect();
@@ -1603,6 +1729,127 @@ fn fit_covering_floor(
         rendered = decoder.render_curve(&floor1_y, half);
     }
     Ok((floor1_y, rendered))
+}
+
+/// The **energy-weighted covering repair** of a point-sampled post
+/// set (`start`, in §7.2.4 post units, `x_list` order): wherever a
+/// segment's dB-linear line falls more than one §10.1 ladder step
+/// under `envelope`, the segment is lifted by the cheapest of three
+/// moves — raise only its left post, only its right post (each by the
+/// least amount that covers every deficit bin given the other post),
+/// or both by the worst deficit — where a move's price is the lift
+/// times the spectral energy under the moved posts' hat functions
+/// (an over-covering floor costs exactly the energy it crushes toward
+/// the residue's dead zone). Sweeps until no segment needs a lift (at
+/// most eight; the caller's re-render pass mops up the rounding of
+/// the integer line render). The old repair — lift both posts by the
+/// worst deficit — propagates: a peak near one end of a long segment
+/// lifts the far post too, which then over-covers the next segment;
+/// measured as floors 20–30 dB above a harmonic series' loudest
+/// partials on a sparse-post stream, and the fix as +3 dB at equal
+/// rate on tonal material at 20–45 kbps and +9 dB at +25 % rate on a
+/// piano corpus at mid quality.
+fn min_covering_posts(
+    start: Vec<i32>,
+    envelope: &[f32],
+    x_list: &[u32],
+    multiplier: u8,
+    half: usize,
+) -> Vec<i32> {
+    let m = i32::from(multiplier);
+    let range = crate::floor1_envelope::floor1_post_range(multiplier) as i32;
+    let n = half.min(envelope.len());
+    let demand: Vec<i32> = envelope[..n]
+        .iter()
+        .map(|&v| i32::from(crate::floor1_envelope::invert_inverse_db(v)) - 1)
+        .collect();
+    let energy: Vec<f64> = envelope[..n]
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .collect();
+    let mut order: Vec<usize> = (0..x_list.len()).collect();
+    order.sort_by_key(|&i| x_list[i]);
+    let xs: Vec<usize> = order.iter().map(|&i| x_list[i] as usize).collect();
+    let mut y: Vec<i32> = order.iter().map(|&i| start[i]).collect();
+    // Energy under post j's hat (the bins whose floor moves when it does).
+    let hat = |j: usize| -> f64 {
+        let mut acc = 0.0;
+        if j > 0 {
+            let xa = xs[j - 1];
+            let end = xs[j].min(n).max(xa);
+            for (o, &e) in energy[xa.min(end)..end].iter().enumerate() {
+                acc += e * o as f64 / (xs[j] - xa) as f64;
+            }
+        }
+        if j + 1 < xs.len() {
+            let (xj, xb) = (xs[j], xs[j + 1]);
+            let end = xb.min(n).max(xj);
+            for (o, &e) in energy[xj.min(end)..end].iter().enumerate() {
+                acc += e * (xb - xj - o) as f64 / (xb - xj) as f64;
+            }
+        }
+        acc
+    };
+    let hats: Vec<f64> = (0..xs.len()).map(hat).collect();
+    for _ in 0..8 {
+        let mut moved = false;
+        for s in 0..xs.len().saturating_sub(1) {
+            let (xa, xb) = (xs[s], xs[s + 1]);
+            let (ya, yb) = (f64::from(y[s] * m), f64::from(y[s + 1] * m));
+            let (mut need_a, mut need_b, mut need_both) = (0.0f64, 0.0f64, 0.0f64);
+            let end = xb.min(n).max(xa);
+            for (o, &want) in demand[xa.min(end)..end].iter().enumerate() {
+                let t = o as f64 / (xb - xa) as f64;
+                let d = f64::from(want) - ((1.0 - t) * ya + t * yb);
+                if d > 0.0 {
+                    need_both = need_both.max(d);
+                    need_a = if t < 1.0 {
+                        need_a.max(d / (1.0 - t))
+                    } else {
+                        f64::INFINITY
+                    };
+                    need_b = if t > 0.0 {
+                        need_b.max(d / t)
+                    } else {
+                        f64::INFINITY
+                    };
+                }
+            }
+            if need_both <= 0.0 {
+                continue;
+            }
+            let up = |v: f64| (v / f64::from(m)).ceil() as i32;
+            let room = |j: usize| range - 1 - y[j];
+            let cost_a = if up(need_a) <= room(s) {
+                need_a * hats[s]
+            } else {
+                f64::INFINITY
+            };
+            let cost_b = if up(need_b) <= room(s + 1) {
+                need_b * hats[s + 1]
+            } else {
+                f64::INFINITY
+            };
+            let cost_both = need_both * (hats[s] + hats[s + 1]);
+            if cost_a <= cost_b && cost_a <= cost_both {
+                y[s] += up(need_a);
+            } else if cost_b <= cost_both {
+                y[s + 1] += up(need_b);
+            } else {
+                y[s] = (y[s] + up(need_both)).min(range - 1);
+                y[s + 1] = (y[s + 1] + up(need_both)).min(range - 1);
+            }
+            moved = true;
+        }
+        if !moved {
+            break;
+        }
+    }
+    let mut posts = vec![0i32; x_list.len()];
+    for (j, &i) in order.iter().enumerate() {
+        posts[i] = y[j].clamp(0, range - 1);
+    }
+    posts
 }
 
 /// How far (dB) the rendered floor may sit under the envelope before
@@ -1656,6 +1903,19 @@ fn encode_pcm_to_packets_geometry(
     if !config.vq_dims.is_power_of_two() || config.vq_dims > 2 {
         return Err(OggFileError::BadVqDims(config.vq_dims));
     }
+    let low_rate = tuning.low_rate_depth > 0.0;
+    // The low-bitrate geometry (see `StreamEncoderConfig::low_rate_geometry`).
+    let (n0, n1) = if low_rate && config.low_rate_geometry {
+        let long = n1.max(LOW_RATE_MIN_BLOCKSIZE);
+        let short = if n0 == n1 {
+            long
+        } else {
+            n0.max(LOW_RATE_MIN_SHORT_BLOCKSIZE).min(long)
+        };
+        (short, long)
+    } else {
+        (n0, n1)
+    };
     let switching = n0 < n1;
     let ch = config.channels as usize;
 
@@ -1733,13 +1993,13 @@ fn encode_pcm_to_packets_geometry(
     // preserve across long↔short transitions). The per-frame scale
     // keeps this per-frame-linear property on a switched stream.
     let mut spectra: Vec<Vec<Vec<f32>>> = Vec::with_capacity(frames); // [frame][channel][bin]
-                                                                      // Per-frame, per-channel phase-predictability figure for the
-                                                                      // masking model's tonality estimate (`psy::unpredictability`):
-                                                                      // the windowed block's complex spectrum against the linear
-                                                                      // extrapolation of the two preceding frames' — defined only where
-                                                                      // the last three frames share one block size (across a §4.3.1
-                                                                      // switch the model falls back to spectral flatness). Only a
-                                                                      // two-deep complex history per channel is kept.
+    // Per-frame, per-channel phase-predictability figure for the
+    // masking model's tonality estimate (`psy::unpredictability`):
+    // the windowed block's complex spectrum against the linear
+    // extrapolation of the two preceding frames' — defined only where
+    // the last three frames share one block size (across a §4.3.1
+    // switch the model falls back to spectral flatness). Only a
+    // two-deep complex history per channel is kept.
     let mut unpred: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(frames);
     {
         // Zero-pad the tail so every frame's analysis span is covered:
@@ -1868,7 +2128,7 @@ fn encode_pcm_to_packets_geometry(
             let half = entry_half(e);
             match tuning.coded_bandwidth_hz {
                 Some(bw) if bw < config.sample_rate as f32 / 2.0 => {
-                    let ps = partition_size_for(half as u32) as usize;
+                    let ps = partition_size_for(half as u32, low_rate) as usize;
                     let bins =
                         (bw / (config.sample_rate as f32 / 2.0) * half as f32).ceil() as usize;
                     bins.div_ceil(ps).max(1) * ps
@@ -1878,7 +2138,7 @@ fn encode_pcm_to_packets_geometry(
             .min(half)
         })
         .collect();
-    let frame_ps = |f: usize| partition_size_for((sizes[f] / 2) as u32) as usize;
+    let frame_ps = |f: usize| partition_size_for((sizes[f] / 2) as u32, low_rate) as usize;
     let frame_res_end = |f: usize| residue_ends[entry_of(f)];
 
     let mut envelopes = Vec::with_capacity(frames);
@@ -1886,6 +2146,8 @@ fn encode_pcm_to_packets_geometry(
         .map(|e| vec![f32::MIN_POSITIVE; entry_half(e)])
         .collect();
     let mut env_seen = vec![false; n_entries];
+    let mut env_log: Vec<Vec<f64>> = (0..n_entries).map(|e| vec![0.0; entry_half(e)]).collect();
+    let mut env_count = vec![0usize; n_entries];
     for (f, (per_ch, m_row)) in spectra.iter().zip(&maskings).enumerate() {
         let e = entry_of(f);
         env_seen[e] = true;
@@ -1898,6 +2160,10 @@ fn encode_pcm_to_packets_geometry(
             for (acc, &v) in env_max[e].iter_mut().zip(&envelope) {
                 *acc = acc.max(v);
             }
+            for (acc, &v) in env_log[e].iter_mut().zip(&envelope) {
+                *acc += f64::from(v.max(1e-12)).ln();
+            }
+            env_count[e] += 1;
             e_row.push(envelope);
         }
         envelopes.push(e_row);
@@ -1921,7 +2187,36 @@ fn encode_pcm_to_packets_geometry(
         } else {
             tuning.floor_post_budget
         };
-        let header = design_floor1_header(env, budget, 0.0, 1, &classes)?;
+        // The post x-list is designed from the size's **geometric-mean**
+        // envelope over the coded band (flat past `residue_end`): the
+        // per-bin maximum over every frame is the envelope of no frame
+        // — on note-to-note material it smooths the low-frequency tilt
+        // flat and spends the budget on the band edge — while the
+        // mean ladder-domain envelope keeps the posts where the
+        // typical frame's dynamics are (measured: a post budget of 8
+        // left one post below 2 kHz on a piano corpus, floors 20–30 dB
+        // above its loudest partials).
+        let end = residue_ends[e];
+        let mut design_env: Vec<f32> = if env_count[e] > 0 {
+            env_log[e]
+                .iter()
+                .map(|&l| (l / env_count[e] as f64).exp() as f32)
+                .collect()
+        } else {
+            env.clone()
+        };
+        if end < design_env.len() {
+            let edge = design_env[end - 1];
+            for v in &mut design_env[end..] {
+                *v = edge;
+            }
+        }
+        // The low-bitrate mode codes posts on the doubled §7.2.4 grid
+        // (`floor1_multiplier = 2`, ~1.1 dB steps): the covering fit
+        // absorbs the coarser grid and every post codeword is a bit
+        // cheaper.
+        let multiplier = if low_rate { 2 } else { 1 };
+        let header = design_floor1_header(&design_env, budget, 0.0, multiplier, &classes)?;
         let decoder = Floor1Decoder::new(&header, std::slice::from_ref(&floor_book))?;
         floor_headers.push(header);
         floor_decoders.push(decoder);
@@ -1980,6 +2275,9 @@ fn encode_pcm_to_packets_geometry(
         let mut t_row = Vec::with_capacity(ch);
         let mut w_row = Vec::with_capacity(ch);
         let mut bw_row = Vec::with_capacity(ch);
+        // The coupling election's weights: in the low-bitrate mode the
+        // **uncapped** audibility ratio (see the election below).
+        let mut ew_row: Vec<Vec<f64>> = Vec::with_capacity(ch);
         for c in 0..ch {
             let (floor1_y, rendered) = fit_covering_floor(
                 &envelopes[f][c],
@@ -1996,14 +2294,31 @@ fn encode_pcm_to_packets_geometry(
             // `residue_end` are never coded (the decoder zeroes them),
             // so the planner sees exactly one weight per coded
             // partition.
-            let w = residue_partition_weights(
-                &rendered,
-                &maskings[f][c],
-                0,
-                frame_res_end(f),
-                partition_size_for(half as u32),
-            )?;
-            let bw = residue_bin_weights(&rendered, &maskings[f][c], 0, frame_res_end(f))?;
+            let (w, bw) = if low_rate {
+                let bw = crate::psy::residue_bin_weights_soft(
+                    &rendered,
+                    &maskings[f][c],
+                    end,
+                    LOW_RATE_WEIGHT_GAMMA,
+                );
+                (partition_means(&bw, frame_ps(f)), bw)
+            } else {
+                (
+                    residue_partition_weights(
+                        &rendered,
+                        &maskings[f][c],
+                        0,
+                        end,
+                        partition_size_for(half as u32, low_rate),
+                    )?,
+                    residue_bin_weights(&rendered, &maskings[f][c], 0, end)?,
+                )
+            };
+            ew_row.push(if low_rate {
+                crate::psy::residue_bin_weights_soft(&rendered, &maskings[f][c], end, 1.0)
+            } else {
+                bw.clone()
+            });
             y_row.push(floor1_y);
             t_row.push(target);
             w_row.push(w);
@@ -2026,8 +2341,27 @@ fn encode_pcm_to_packets_geometry(
                     .collect()
             };
             let (t_mag, t_ang) = (target_s(mag), target_s(ang));
-            let bw_mag = residue_bin_weights(&rendered_s, &maskings[f][mag], 0, end)?;
-            let bw_ang = residue_bin_weights(&rendered_s, &maskings[f][ang], 0, end)?;
+            let (bw_mag, bw_ang) = if low_rate {
+                (
+                    crate::psy::residue_bin_weights_soft(
+                        &rendered_s,
+                        &maskings[f][mag],
+                        end,
+                        LOW_RATE_WEIGHT_GAMMA,
+                    ),
+                    crate::psy::residue_bin_weights_soft(
+                        &rendered_s,
+                        &maskings[f][ang],
+                        end,
+                        LOW_RATE_WEIGHT_GAMMA,
+                    ),
+                )
+            } else {
+                (
+                    residue_bin_weights(&rendered_s, &maskings[f][mag], 0, end)?,
+                    residue_bin_weights(&rendered_s, &maskings[f][ang], 0, end)?,
+                )
+            };
             // Bits-like measure: `log2(1 + w·t²)` per bin — the rate a
             // bin needs to bring its weighted error under the mask
             // grows with the log of its audible energy, and a sum of
@@ -2038,17 +2372,34 @@ fn encode_pcm_to_packets_geometry(
             // 2.5× under coupling and outweighed the hundreds of
             // identical mid bins that halve.)
             let bits = |w: f64, t: f32| (1.0 + w * f64::from(t * t)).log2();
+            // In the low-bitrate mode the election prices both
+            // layouts under the **uncapped** audibility ratios: coupled,
+            // the quantisation noise of both vectors lands in each
+            // output channel at the shared floor's level, so a quiet
+            // channel of a panned pair (its own threshold far under the
+            // shared floor) is charged for it. Under the capped weights
+            // both channels saturate alike and a hard-panned note read
+            // as profitably coupled — measured as the quiet channel
+            // coding 12 dB under its uncoupled SNR.
+            let (ew_mag, ew_ang) = if low_rate {
+                (
+                    crate::psy::residue_bin_weights_soft(&rendered_s, &maskings[f][mag], end, 1.0),
+                    crate::psy::residue_bin_weights_soft(&rendered_s, &maskings[f][ang], end, 1.0),
+                )
+            } else {
+                (bw_mag.clone(), bw_ang.clone())
+            };
             let mut uncoupled = 0.0f64;
             let mut coupled = 0.0f64;
             for k in 0..end {
                 let (l, r) = (t_row[mag][k], t_row[ang][k]);
-                uncoupled += bits(bw_row[mag][k], l) + bits(bw_row[ang][k], r);
+                uncoupled += bits(ew_row[mag][k], l) + bits(ew_row[ang][k], r);
                 let (m, a) = crate::synthesis::forward_couple_scalar(t_mag[k], t_ang[k]);
                 let scale = angle_weight_scale(
                     (k as f32 + 0.5) * config.sample_rate as f32 / (2.0 * half as f32),
                     tuning,
                 );
-                let w = bw_mag[k].max(bw_ang[k]);
+                let w = ew_mag[k].max(ew_ang[k]);
                 coupled += bits(w, m) + bits(w * f64::from(scale), a);
             }
             cand_row.push(PairCandidate {
@@ -2706,6 +3057,7 @@ fn encode_pcm_to_packets_geometry(
             &residue_ends_u32,
             &mode_specs,
             switching,
+            low_rate,
         )
     };
     let mut setup = build(&coarse, &fine, &noise, &band_candidates);
@@ -2793,6 +3145,14 @@ fn encode_pcm_to_packets_geometry(
     // setup header packet plus the classword and residue-value
     // codewords (floor emissions are identical across sets).
     let trained: Vec<VorbisCodebook> = setup.codebooks[2..].to_vec();
+    // The low-bitrate mode plans with rate-distortion VQ entry
+    // selection (measured: 3–10 % fewer audio bytes at equal SNR on
+    // speech, music and tonal material at 10–35 kbps).
+    let plan_classes = if low_rate {
+        crate::residue_encode::plan_vector_classifications_rd_bin_weighted_entry_rd
+    } else {
+        plan_vector_classifications_rd_bin_weighted
+    };
     type Evaluated = (f64, VorbisSetupHeader, Vec<Vec<ResidueVectorPlan>>);
     // A candidate set is a list of indices into the *trained* band
     // books (`trained[3..]`), so every evaluation prices the exact
@@ -2843,7 +3203,7 @@ fn encode_pcm_to_packets_geometry(
                     // read is selected under its own elements'
                     // audibility weights and the Lagrangian charges the
                     // weighted error directly.
-                    let choices = plan_vector_classifications_rd_bin_weighted(
+                    let choices = plan_classes(
                         &targets[f][c][..end],
                         &value_rows,
                         1,
@@ -3022,7 +3382,7 @@ fn encode_pcm_to_packets_geometry(
                             .zip(&m_dec)
                             .map(|(&t, &m)| if m == 0.0 { 0.0 } else { t })
                             .collect();
-                        let choice = plan_vector_classifications_rd_bin_weighted(
+                        let choice = plan_classes(
                             &masked,
                             &value_rows,
                             1,
@@ -3052,7 +3412,7 @@ fn encode_pcm_to_packets_geometry(
                         let bits =
                             (scored.bit_cost + a_bits) as f64 + bias_of(cm as u32) + bias_of(ca);
                         let cost = err + tuning.lambda * bits;
-                        if best.as_ref().map_or(true, |b| cost < b.0) {
+                        if best.as_ref().is_none_or(|b| cost < b.0) {
                             best = Some((cost, cm as u32, scored.entries, ca, ea, err));
                         }
                     }
@@ -3100,15 +3460,15 @@ fn encode_pcm_to_packets_geometry(
             }
         }
         for book in 2..setup.codebooks.len() {
-            if let Some(freqs) = tallies.counts(book) {
-                if freqs.iter().any(|&f| f > 0) {
-                    setup.codebooks[book] = crate::book_design::redesign_codebook(
-                        &setup.codebooks[book],
-                        freqs,
-                        VQ_DESIGN_MAX_CODEWORD_LEN,
-                        false,
-                    )?;
-                }
+            if let Some(freqs) = tallies.counts(book)
+                && freqs.iter().any(|&f| f > 0)
+            {
+                setup.codebooks[book] = crate::book_design::redesign_codebook(
+                    &setup.codebooks[book],
+                    freqs,
+                    VQ_DESIGN_MAX_CODEWORD_LEN,
+                    false,
+                )?;
             }
         }
         // The exact serialised cost the band choice can move — the
@@ -3156,7 +3516,6 @@ fn encode_pcm_to_packets_geometry(
         }
     }
     let (_, setup, frame_plans) = best;
-    // ---- the three §4.2 header packets ----
     let id_packet = write_identification_header(&VorbisIdentificationHeader {
         vorbis_version: 0,
         audio_channels: config.channels,
@@ -3218,6 +3577,7 @@ fn encode_pcm_to_packets_geometry(
 /// A decoded Ogg/Vorbis stream: per-channel PCM rows (bitstream
 /// channel order) plus the stream parameters.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DecodedOggStream {
     /// Per-channel PCM rows, §A.2 end-trimmed to the final page's
     /// granule position.
@@ -3289,4 +3649,52 @@ pub fn decode_ogg_to_pcm(data: &[u8]) -> Result<DecodedOggStream, OggFileError> 
         sample_rate: id.audio_sample_rate,
         channels: id.audio_channels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Covering repair on a harmonic-like envelope: every bin ends
+    /// within one ladder step under the floor, and the loud low line
+    /// next to a long falling segment is covered by moving the near
+    /// post, not by lifting the far one above its own content.
+    #[test]
+    fn covering_repair_covers_and_stays_tight() {
+        let half = 256usize;
+        let table = &crate::floor1::INVERSE_DB_TABLE;
+        let mut envelope = vec![table[20]; half];
+        // A loud line at bin 12, a falling series of partials after.
+        envelope[12] = table[230];
+        for (i, k) in (40..200).step_by(20).enumerate() {
+            envelope[k] = table[200 - 12 * i];
+        }
+        let x_list: Vec<u32> = vec![0, 256, 8, 30, 120, 220];
+        let start: Vec<i32> = x_list
+            .iter()
+            .map(|&x| {
+                i32::from(crate::floor1_envelope::invert_inverse_db(
+                    envelope[(x as usize).min(half - 1)],
+                ))
+            })
+            .collect();
+        let posts = min_covering_posts(start, &envelope, &x_list, 1, half);
+        // Render the dB-linear segments (ladder domain) and check cover.
+        let mut order: Vec<usize> = (0..x_list.len()).collect();
+        order.sort_by_key(|&i| x_list[i]);
+        for w in order.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let (xa, xb) = (x_list[a] as usize, x_list[b] as usize);
+            for (k, &v) in envelope.iter().enumerate().take(xb.min(half)).skip(xa) {
+                let t = (k - xa) as f64 / (xb - xa) as f64;
+                let line = (1.0 - t) * f64::from(posts[a]) + t * f64::from(posts[b]);
+                let want = f64::from(crate::floor1_envelope::invert_inverse_db(v)) - 1.0;
+                assert!(line >= want - 1e-9, "bin {k}: {line} < {want}");
+            }
+        }
+        // The post at x = 120 sits in the quiet tail of the falling
+        // series: it must not be lifted to the loud line's level.
+        let p120 = posts[x_list.iter().position(|&x| x == 120).unwrap()];
+        assert!(p120 < 200, "far post over-lifted to {p120}");
+    }
 }

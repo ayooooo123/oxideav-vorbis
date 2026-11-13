@@ -79,7 +79,7 @@
 //! [`crate::encoder::write_audio_packet`] path.
 
 use crate::codebook::{VorbisCodebook, VqLookup};
-use crate::vq::{quantize_vector, QuantizeError};
+use crate::vq::{QuantizeError, quantize_vector};
 
 /// Errors that can arise while planning a residue partition's cascade
 /// (Vorbis I §8.6.2 / §8.6.3 / §8.6.4).
@@ -321,7 +321,7 @@ fn partition_reads(
     let n = partition_size as usize;
     let dims = dimensions as usize;
     if residue_type == 0 {
-        if n % dims != 0 {
+        if !n.is_multiple_of(dims) {
             return Err(ResidueEncodeError::Format0NotDivisible {
                 pass,
                 partition_size,
@@ -363,11 +363,7 @@ fn gather_index(
         // §8.6.4: append contiguously, k*dims + j.
         read * dims + j
     };
-    if idx < n {
-        Some(idx)
-    } else {
-        None
-    }
+    if idx < n { Some(idx) } else { None }
 }
 
 /// Plan one residue partition's cascade (Vorbis I §8.6.2 step 19 in the
@@ -468,7 +464,14 @@ pub fn plan_partition_cascade_scored(
     residue_type: u16,
     partition_size: u32,
 ) -> Result<ScoredPartitionCascade, ResidueEncodeError> {
-    plan_partition_cascade_impl(residual, stage_books, residue_type, partition_size, None)
+    plan_partition_cascade_impl(
+        residual,
+        stage_books,
+        residue_type,
+        partition_size,
+        None,
+        0.0,
+    )
 }
 
 /// [`plan_partition_cascade_scored`] under **per-element weights**
@@ -511,6 +514,51 @@ pub fn plan_partition_cascade_scored_weighted(
         residue_type,
         partition_size,
         Some(weights),
+        0.0,
+    )
+}
+
+/// [`plan_partition_cascade_scored_weighted`] with **rate-distortion
+/// entry selection** at the Lagrangian `lambda` (bits → weighted
+/// distortion): each VQ read takes the entry minimising its weighted
+/// error plus `lambda` × its codeword length
+/// ([`crate::vq::refine_entry_rd`]) instead of the plain nearest one.
+/// `lambda = 0` is exactly the nearest-entry cascade.
+///
+/// # Errors
+///
+/// As [`plan_partition_cascade_scored_weighted`].
+#[doc(hidden)]
+pub fn plan_partition_cascade_scored_weighted_rd(
+    residual: &[f32],
+    stage_books: &[Option<&VorbisCodebook>; 8],
+    residue_type: u16,
+    partition_size: u32,
+    weights: &[f64],
+    lambda: f64,
+) -> Result<ScoredPartitionCascade, ResidueEncodeError> {
+    if weights.len() != partition_size as usize {
+        return Err(ResidueEncodeError::WeightLengthMismatch {
+            expected: partition_size as usize,
+            actual: weights.len(),
+        });
+    }
+    if let Some(p) = weights.iter().position(|v| !v.is_finite() || *v < 0.0) {
+        return Err(ResidueEncodeError::BadWeight {
+            partition: p,
+            value: weights[p],
+        });
+    }
+    if !lambda.is_finite() || lambda < 0.0 {
+        return Err(ResidueEncodeError::NonFiniteLambda(lambda));
+    }
+    plan_partition_cascade_impl(
+        residual,
+        stage_books,
+        residue_type,
+        partition_size,
+        Some(weights),
+        lambda,
     )
 }
 
@@ -520,6 +568,7 @@ fn plan_partition_cascade_impl(
     residue_type: u16,
     partition_size: u32,
     weights: Option<&[f64]>,
+    rd_lambda: f64,
 ) -> Result<ScoredPartitionCascade, ResidueEncodeError> {
     if residue_type > 2 {
         return Err(ResidueEncodeError::UnsupportedResidueType(residue_type));
@@ -583,6 +632,7 @@ fn plan_partition_cascade_impl(
                         });
                     }
                     crate::vq::quantize_vector_weighted(book, &target, &read_w)
+                        .map(|q| crate::vq::refine_entry_rd(book, &target, &read_w, rd_lambda, q))
                 }
                 None => quantize_vector(book, &target),
             }
@@ -896,7 +946,7 @@ pub fn plan_vector_classifications(
         return Err(ResidueEncodeError::NoClassifications);
     }
     let ps = partition_size as usize;
-    if scalars.len() % ps != 0 {
+    if !scalars.len().is_multiple_of(ps) {
         return Err(ResidueEncodeError::ResidualLengthMismatch {
             // The expected length is the nearest multiple at or below the
             // supplied length; report the supplied length's remainder via
@@ -1164,6 +1214,53 @@ pub fn plan_vector_classifications_rd_bin_weighted(
         None,
         Some(bin_weights),
         class_bit_bias,
+        false,
+    )
+}
+
+/// [`plan_vector_classifications_rd_bin_weighted`] with
+/// **rate-distortion VQ entry selection** inside every candidate
+/// cascade: each read takes the entry minimising its weighted error
+/// plus `lambda` × its codeword length
+/// ([`crate::vq::refine_entry_rd`]) rather than the nearest one — the
+/// rate-aware dead zone the low-bitrate mode codes with. Same
+/// validation and errors.
+///
+/// # Errors
+///
+/// As [`plan_vector_classifications_rd_bin_weighted`].
+#[doc(hidden)]
+pub fn plan_vector_classifications_rd_bin_weighted_entry_rd(
+    scalars: &[f32],
+    value_books: &[[Option<&VorbisCodebook>; 8]],
+    residue_type: u16,
+    partition_size: u32,
+    lambda: f64,
+    bin_weights: &[f64],
+    class_bit_bias: Option<&[f64]>,
+) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
+    if bin_weights.len() != scalars.len() {
+        return Err(ResidueEncodeError::WeightLengthMismatch {
+            expected: scalars.len(),
+            actual: bin_weights.len(),
+        });
+    }
+    if let Some(p) = bin_weights.iter().position(|v| !v.is_finite() || *v < 0.0) {
+        return Err(ResidueEncodeError::BadWeight {
+            partition: p,
+            value: bin_weights[p],
+        });
+    }
+    plan_vector_classifications_rd_core(
+        scalars,
+        value_books,
+        residue_type,
+        partition_size,
+        lambda,
+        None,
+        Some(bin_weights),
+        class_bit_bias,
+        true,
     )
 }
 
@@ -1189,6 +1286,7 @@ fn plan_vector_classifications_rd_impl(
         weights,
         None,
         class_bit_bias,
+        false,
     )
 }
 
@@ -1202,6 +1300,7 @@ fn plan_vector_classifications_rd_core(
     weights: Option<&[f64]>,
     bin_weights: Option<&[f64]>,
     class_bit_bias: Option<&[f64]>,
+    entry_rd: bool,
 ) -> Result<Vec<PartitionClassChoice>, ResidueEncodeError> {
     if residue_type > 2 {
         return Err(ResidueEncodeError::UnsupportedResidueType(residue_type));
@@ -1216,7 +1315,7 @@ fn plan_vector_classifications_rd_core(
         return Err(ResidueEncodeError::NonFiniteLambda(lambda));
     }
     let ps = partition_size as usize;
-    if scalars.len() % ps != 0 {
+    if !scalars.len().is_multiple_of(ps) {
         return Err(ResidueEncodeError::ResidualLengthMismatch {
             expected: (scalars.len() / ps) * ps,
             actual: scalars.len(),
@@ -1263,12 +1362,13 @@ fn plan_vector_classifications_rd_core(
         let mut best_stages = usize::MAX;
         for (class, stage_books) in value_books.iter().enumerate() {
             let scored = match bin_weights {
-                Some(bw) => plan_partition_cascade_scored_weighted(
+                Some(bw) => plan_partition_cascade_scored_weighted_rd(
                     partition_scalars,
                     stage_books,
                     residue_type,
                     partition_size,
                     &bw[p * ps..(p + 1) * ps],
+                    if entry_rd { lambda } else { 0.0 },
                 )?,
                 None => plan_partition_cascade_scored(
                     partition_scalars,
@@ -2204,7 +2304,7 @@ mod tests {
             },
         };
         let fine = tess_book(2, 4, vec![0, 0, 1, 1, 2, 2, 3, 3]); // delta 1
-                                                                  // class 0: coarse alone → nearest to [3,3] is [2,2] or [4,4], err 2.
+        // class 0: coarse alone → nearest to [3,3] is [2,2] or [4,4], err 2.
         let mut row0: [Option<&VorbisCodebook>; 8] = [None; 8];
         row0[0] = Some(&coarse);
         // class 1: coarse then fine → coarse [2,2] (or [4,4]) leaves ±1, fine
